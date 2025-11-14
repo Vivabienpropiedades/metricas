@@ -1,0 +1,1279 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestor de Métricas de Vivabien Propiedades</title>
+    
+<script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Librerías de Gráficos: Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    
+    <!-- Librería para Generación de PDF -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    
+    <!-- Bloque de Script NO-MODULE: Contiene funciones globales (como showSection/showMessage) para ser accesibles desde onclick -->
+    <script>
+        // Configuración de Tailwind para definir el color #225479
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'realestate-primary': '#225479',
+                        'realestate-secondary': '#e0f2fe',
+                        'realestate-accent': '#10b981', // Verde para éxito
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        }
+
+        /**
+         * Función para cambiar entre secciones
+         * @param {string} sectionId - El ID de la sección a mostrar
+         */
+        function showSection(sectionId) {
+            const sections = ['registro-propiedades', 'registro-metricas', 'visualizacion-datos', 'informes'];
+            sections.forEach(id => {
+                const section = document.getElementById(id);
+                if (section) {
+                    section.classList.add('hidden');
+                }
+            });
+
+            const targetSection = document.getElementById(sectionId);
+            if (targetSection) {
+                targetSection.classList.remove('hidden');
+            }
+
+            // Actualizar estado de navegación
+            const navButtons = document.querySelectorAll('#sidebar button');
+            navButtons.forEach(btn => {
+                if (btn.dataset.target === sectionId) {
+                    btn.classList.add('bg-realestate-secondary', 'text-realestate-primary');
+                } else {
+                    btn.classList.remove('bg-realestate-secondary', 'text-realestate-primary');
+                }
+            });
+            
+            // Si vamos a la sección de visualización, intentamos renderizar los gráficos.
+            if (sectionId === 'visualizacion-datos' && typeof window.filterAndRenderCharts === 'function') {
+                 // Usamos un pequeño retraso para asegurar que el DOM esté listo antes de dibujar el canvas.
+                setTimeout(() => window.filterAndRenderCharts(), 100); 
+            }
+            // Si vamos a la sección de métricas, aseguramos que el historial se renderice (aunque ya es en tiempo real)
+            if (sectionId === 'registro-metricas' && typeof window.renderMetricsHistory === 'function') {
+                setTimeout(() => window.renderMetricsHistory(window.allMetrics || []), 100); 
+            }
+            // Si vamos a la sección de informes, nos aseguramos de llenar el selector
+            if (sectionId === 'informes' && typeof window.fillPropertySelectors === 'function') {
+                setTimeout(() => window.fillPropertySelectors(window.registeredProperties), 100); 
+                // Limpiar el área de informe anterior
+                document.getElementById('report-output').innerHTML = '<p class="text-gray-500 italic">Filtra y genera un informe.</p>';
+            }
+        }
+
+        /**
+         * Muestra un mensaje de notificación.
+         * @param {string} message - El mensaje a mostrar.
+         * @param {'success'|'error'} type - Tipo de mensaje.
+         */
+        function showMessage(message, type) {
+            const container = document.getElementById('message-container');
+            container.textContent = message;
+            container.classList.remove('hidden', 'bg-red-100', 'bg-green-100', 'text-red-700', 'text-green-700');
+            
+            if (type === 'success') {
+                container.classList.add('bg-green-100', 'text-green-700');
+            } else {
+                container.classList.add('bg-red-100', 'text-red-700');
+            }
+
+            setTimeout(() => {
+                container.classList.add('hidden');
+            }, 3000);
+        }
+
+        window.onload = function() {
+            // Inicializar vista de sección
+            showSection('registro-propiedades');
+        }
+    </script>
+
+    <!-- Bloque de Script MODULE: Contiene lógica de Firebase, Gráficos y Eventos -->
+<script type="module">
+        import { createIcons, Search, PlusCircle, BarChart3, FileText, Home, Download, ClipboardCopy } from 'https://cdn.jsdelivr.net/npm/lucide@latest/dist/esm/lucide.js';
+        createIcons({ icons: { Search, PlusCircle, BarChart3, FileText, Home, Download, ClipboardCopy } });
+
+        // --- FIREBASE IMPORTS ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- FIREBASE GLOBAL VARIABLES ---
+        let db;
+        let auth;
+        let userId;
+        let propertiesUnsubscribe;
+        let metricsUnsubscribe;
+        
+        // Almacena datos globales (hecho global en window para accesibilidad)
+        window.registeredProperties = []; 
+        window.allMetrics = [];
+        let chartInstance = null; // Instancia de Chart.js
+
+        // setLogLevel('debug'); // Descomentar para debug de Firebase
+
+        /**
+         * Inicializa Firebase y autentica al usuario.
+         */
+        async function initFirebase() {
+            try {
+                // Obtener configuraciones globales (Canvas provided)
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+                if (Object.keys(firebaseConfig).length === 0) {
+                    console.error("Firebase config is missing. Using placeholder data.");
+                    return;
+                }
+
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Autenticación con token o anónima
+                if (typeof __initial_auth_token !== 'undefined') {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                userId = auth.currentUser?.uid || crypto.randomUUID();
+                console.log("Firebase initialized. User ID:", userId);
+
+                document.getElementById('current-user-id').textContent = userId;
+
+                // Iniciar escucha en tiempo real de propiedades y métricas
+                setupPropertiesListener(appId, userId);
+                setupMetricsListener(appId, userId);
+
+            } catch (error) {
+                console.error("Error initializing Firebase or during sign-in:", error);
+            }
+        }
+
+        /**
+         * Retorna la referencia a la colección de propiedades del usuario.
+         */
+        function getPropertiesCollection(appId, userId) {
+            if (!db) return null;
+            // Colección privada: /artifacts/{appId}/users/{userId}/properties
+            return collection(db, `artifacts/${appId}/users/${userId}/properties`);
+        }
+        
+        /**
+         * Retorna la referencia base a las métricas (usada para la consulta 'GetDocs').
+         */
+        function getMetricsCollectionGroup(appId, userId, propertyId) {
+            if (!db) return null;
+            // Colección de métricas anidada: /.../properties/{propiedadId}/metrics
+            return collection(db, `artifacts/${appId}/users/${userId}/properties/${propertyId}/metrics`);
+        }
+        
+        // --- PROPIEDADES (Listener y Render) ---
+        
+        /**
+         * Rellena el select de propiedades con los datos cargados.
+         * Hecha global para ser accesible desde el bloque no-module y en la inicialización.
+         */
+        window.fillPropertySelectors = function(properties) {
+            const selectors = [
+                document.getElementById('propiedad_id'),          // Registro Métricas
+                document.getElementById('visualizacion_propiedad_id'), // Visualización
+                document.getElementById('informe_propiedad_id')    // Informes
+            ];
+
+            selectors.forEach(selector => {
+                if (!selector) return;
+
+                // Guardar la selección actual antes de limpiar
+                const currentVal = selector.value;
+
+                // Limpiar opciones anteriores
+                selector.innerHTML = '<option value="" disabled selected>Selecciona una propiedad</option>';
+                
+                if (properties.length === 0) {
+                    selector.innerHTML += '<option value="" disabled>No hay propiedades registradas</option>';
+                    return;
+                }
+
+                properties.forEach(p => {
+                    const option = document.createElement('option');
+                    // Usar el ID completo para el registro de métricas y mostrar los primeros 8 dígitos
+                    option.value = p.id; 
+                    option.textContent = `${p.direccion} (${p.id.substring(0, 8)}...) - ${p.tipo}`;
+                    selector.appendChild(option);
+                });
+                
+                // Restaurar la selección si es válida
+                if (currentVal && properties.some(p => p.id === currentVal)) {
+                    selector.value = currentVal;
+                } else if (selector.id === 'visualizacion_propiedad_id' && properties.length > 0) {
+                    // Seleccionar la primera propiedad en el selector de visualización por defecto si no hay una seleccionada
+                    selector.value = properties[0].id;
+                }
+            });
+        }
+
+        /**
+         * Configura el listener de onSnapshot para recibir actualizaciones en tiempo real.
+         */
+        function setupPropertiesListener(appId, userId) {
+            const propertiesCollection = getPropertiesCollection(appId, userId);
+            if (!propertiesCollection) return;
+            
+            if (propertiesUnsubscribe) {
+                propertiesUnsubscribe(); // Limpiar listener anterior
+            }
+
+            const q = query(propertiesCollection);
+
+            propertiesUnsubscribe = onSnapshot(q, (snapshot) => {
+                window.registeredProperties = [];
+                snapshot.forEach((doc) => {
+                    window.registeredProperties.push({ id: doc.id, ...doc.data() });
+                });
+                renderPropertiesHistory(window.registeredProperties);
+                window.fillPropertySelectors(window.registeredProperties); 
+                window.filterAndRenderCharts(); // Actualizar gráficos al cambiar propiedades (para seleccionar la primera por defecto)
+                setupMetricsListener(appId, userId); // Reiniciar listeners de métricas para las nuevas propiedades
+            }, (error) => {
+                console.error("Error fetching properties:", error);
+                window.showMessage("Error al cargar el historial de propiedades.", 'error'); 
+            });
+        }
+        
+        // --- MÉTRICAS (Listener y Fetching) ---
+
+        /**
+         * Configura un listener para escuchar los cambios en TODAS las métricas
+         * de TODAS las propiedades y almacenarlas en 'allMetrics'.
+         */
+        function setupMetricsListener(appId, userId) {
+            if (metricsUnsubscribe) {
+                // Limpiar todos los listeners de métricas anteriores
+                if (Array.isArray(metricsUnsubscribe)) {
+                    metricsUnsubscribe.forEach(unsub => unsub());
+                }
+            }
+            metricsUnsubscribe = [];
+            window.allMetrics = [];
+            
+            // Si no hay propiedades, no hay métricas que escuchar.
+            if (!window.registeredProperties || window.registeredProperties.length === 0) {
+                window.filterAndRenderCharts(); // Limpiar gráfico
+                window.renderMetricsHistory(window.allMetrics); // Limpiar historial
+                return;
+            }
+
+            window.registeredProperties.forEach(prop => {
+                const metricsCollection = getMetricsCollectionGroup(appId, userId, prop.id);
+                if (!metricsCollection) return;
+
+                const unsub = onSnapshot(metricsCollection, (snapshot) => {
+                    // Primero, eliminar métricas viejas de esta propiedad del array global
+                    window.allMetrics = window.allMetrics.filter(m => m.propiedad_id !== prop.id);
+                    
+                    // Agregar las nuevas métricas
+                    snapshot.forEach(doc => {
+                        window.allMetrics.push({ id: doc.id, ...doc.data(), propiedad_id: prop.id });
+                    });
+                    
+                    // Re-renderizar las vistas con los datos actualizados
+                    window.filterAndRenderCharts();
+                    window.renderMetricsHistory(window.allMetrics);
+
+                }, (error) => {
+                    console.error(`Error fetching metrics for property ${prop.id}:`, error);
+                });
+                metricsUnsubscribe.push(unsub);
+            });
+            console.log(`Listening to metrics for ${window.registeredProperties.length} properties.`);
+        }
+        
+        
+        // --- LÓGICA DE GRÁFICOS (Chart.js) ---
+
+        /**
+         * Filtra las métricas según los parámetros de la UI y renderiza el gráfico.
+         * Esta función se hace global para que el bloque NO-MODULE pueda llamarla.
+         */
+        window.filterAndRenderCharts = function() {
+            const propertyId = document.getElementById('visualizacion_propiedad_id')?.value;
+            const dateFrom = document.getElementById('fecha_filtro_inicio')?.value;
+            const dateTo = document.getElementById('fecha_filtro_termino')?.value;
+            
+            // 1. Filtrar Propiedad
+            let filteredMetrics = window.allMetrics.filter(m => {
+                // Si no hay propiedad seleccionada, no mostrar nada.
+                if (!propertyId) return false;
+                return m.propiedad_id === propertyId;
+            });
+            
+            // 2. Filtrar por Fechas
+            if (dateFrom) {
+                filteredMetrics = filteredMetrics.filter(m => m.fecha_medicion >= dateFrom);
+            }
+            if (dateTo) {
+                filteredMetrics = filteredMetrics.filter(m => m.fecha_medicion <= dateTo);
+            }
+            
+            // 3. Ordenar por fecha para el gráfico
+            filteredMetrics.sort((a, b) => new Date(a.fecha_medicion) - new Date(b.fecha_medicion));
+
+            // 4. Preparar Datos para Chart.js
+            const labels = filteredMetrics.map(m => m.fecha_medicion);
+            
+            const datasets = [
+                {
+                    label: 'Visualizaciones',
+                    data: filteredMetrics.map(m => m.visualizaciones),
+                    borderColor: 'rgb(34, 84, 121)', // realestate-primary
+                    backgroundColor: 'rgba(34, 84, 121, 0.1)',
+                    yAxisID: 'y',
+                    tension: 0.2
+                },
+                {
+                    label: 'Contactos Recibidos',
+                    data: filteredMetrics.map(m => m.contactos),
+                    borderColor: 'rgb(255, 159, 64)', 
+                    backgroundColor: 'rgba(255, 159, 64, 0.1)',
+                    yAxisID: 'y',
+                    tension: 0.2
+                },
+                {
+                    label: 'Visitas Físicas',
+                    data: filteredMetrics.map(m => m.visitas_fisicas),
+                    borderColor: 'rgb(75, 192, 192)', 
+                    backgroundColor: 'rgba(75, 192, 192, 0.1)',
+                    yAxisID: 'y',
+                    tension: 0.2
+                },
+                {
+                    label: 'Ofertas Recibidas',
+                    data: filteredMetrics.map(m => m.ofertas_recibidas),
+                    borderColor: 'rgb(16, 185, 129)', // realestate-accent
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    yAxisID: 'y',
+                    tension: 0.2
+                }
+            ];
+
+            renderChart(labels, datasets);
+        }
+
+        /**
+         * Dibuja o actualiza la instancia de Chart.js.
+         */
+        function renderChart(labels, datasets) {
+            const ctx = document.getElementById('metricsChart');
+            if (!ctx) return;
+            
+            // Destruir instancia anterior si existe
+            if (chartInstance) {
+                chartInstance.destroy();
+            }
+
+            const chartContainer = ctx.parentElement.querySelector('#chart-message');
+            
+            if (labels.length === 0) {
+                 // Si no hay datos, mostrar un mensaje en el canvas
+                 ctx.style.backgroundColor = '#f3f4f6'; 
+                 chartContainer.classList.remove('hidden');
+                 return;
+            } else {
+                 ctx.style.backgroundColor = '#ffffff'; 
+                 chartContainer.classList.add('hidden');
+            }
+
+
+            chartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Evolución Histórica de Métricas de Propiedad',
+                            font: { size: 16, weight: 'bold' },
+                            color: '#225479'
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                        }
+                    },
+                    scales: {
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Fecha de Medición',
+                                color: '#4b5563'
+                            }
+                        },
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: {
+                                display: true,
+                                text: 'Conteo de Métricas',
+                                color: '#4b5563'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
+        // --- OPERACIONES DE FIREBASE (CRUD) ---
+
+        /**
+         * Guarda una nueva propiedad en Firestore.
+         */
+        async function saveProperty(data) {
+            if (!db || !userId) {
+                window.showMessage('Error: Base de datos no inicializada. Intente recargar.', 'error');
+                return false;
+            }
+
+            try {
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                const docRef = await addDoc(getPropertiesCollection(appId, userId), {
+                    ...data,
+                    created_at: new Date().toISOString() 
+                });
+                window.showMessage(`Propiedad registrada con ID: ${docRef.id.substring(0, 8)}...`, 'success');
+                return true;
+            } catch (error) {
+                console.error("Error adding document: ", error);
+                window.showMessage('Error al guardar la propiedad.', 'error');
+                return false;
+            }
+        }
+
+        /**
+         * Guarda una nueva métrica en Firestore, vinculada a una propiedad.
+         */
+        async function saveMetric(data) {
+            if (!db || !userId) {
+                window.showMessage('Error: Base de datos no inicializada.', 'error');
+                return false;
+            }
+
+            const propiedadId = data.propiedad_id.trim();
+
+            if (propiedadId.length === 0) {
+                window.showMessage('Error: Debes seleccionar el ID de la propiedad.', 'error');
+                return false;
+            }
+
+            try {
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                // Referencia a la subcolección de métricas
+                const metricsCollectionRef = getMetricsCollectionGroup(appId, userId, propiedadId);
+                
+                // Convertir campos numéricos de string a number para un mejor análisis
+                const numericData = {
+                    visualizaciones: parseInt(data.visualizaciones, 10),
+                    contactos: parseInt(data.contactos, 10),
+                    visitas_fisicas: parseInt(data.visitas_fisicas, 10),
+                    ofertas_recibidas: parseInt(data.ofertas_recibidas, 10),
+                    fecha_medicion: data.fecha_medicion,
+                    propiedad_id: propiedadId,
+                    created_at: new Date().toISOString()
+                };
+
+                const docRef = await addDoc(metricsCollectionRef, numericData);
+                window.showMessage(`Métrica registrada para ID ${propiedadId.substring(0, 8)}... Doc ID: ${docRef.id.substring(0, 8)}...`, 'success');
+                return true;
+
+            } catch (error) {
+                console.error("Error adding metric document: ", error);
+                window.showMessage('Error al guardar la métrica. Asegúrate de que las métricas sean números válidos.', 'error');
+                return false;
+            }
+        }
+        
+        // --- FUNCIONES DE RENDERIZADO DE TABLA ---
+        
+        /**
+         * Renders the property history table.
+         */
+        function renderPropertiesHistory(properties) {
+            const tableBody = document.getElementById('properties-history-body');
+            if (!tableBody) return;
+
+            if (properties.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="6" class="p-4 text-center text-gray-500">Aún no hay propiedades registradas.</td></tr>';
+                return;
+            }
+
+            // Ordenar por la fecha de inicio más reciente
+            properties.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            tableBody.innerHTML = properties.map(p => `
+                <tr class="border-b hover:bg-gray-50">
+                    <td class="px-6 py-4 text-sm font-medium text-gray-900">${p.id.substring(0, 8)}...</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">${p.direccion}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">${p.tipo}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">${p.fecha_inicio}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">${p.precio_publicacion} ${p.moneda_publicacion}</td>
+                    <td class="px-6 py-4">
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${p.estado === 'Activa' ? 'bg-realestate-accent/10 text-realestate-accent' : 'bg-yellow-100 text-yellow-800'}">
+                            ${p.estado}
+                        </span>
+                    </td>
+                </tr>
+            `).join('');
+        }
+        
+        /**
+         * Renders the metrics history table. Se hace global para ser accesible en el onload
+         */
+        window.renderMetricsHistory = function(metrics) {
+            const tableBody = document.getElementById('metrics-history-body');
+            if (!tableBody) return;
+
+            if (metrics.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="6" class="p-4 text-center text-gray-500">Aún no hay métricas registradas.</td></tr>';
+                return;
+            }
+
+            // Ordenar por fecha de medición, el más reciente primero
+            metrics.sort((a, b) => new Date(b.fecha_medicion) - new Date(a.fecha_medicion));
+
+            tableBody.innerHTML = metrics.map(m => `
+                <tr class="border-b hover:bg-gray-50">
+                    <td class="px-6 py-4 text-sm font-medium text-gray-900">${m.fecha_medicion}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500">${m.propiedad_id.substring(0, 8)}...</td>
+                    <td class="px-6 py-4 text-sm text-gray-500 text-center">${m.visualizaciones}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500 text-center">${m.contactos}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500 text-center">${m.visitas_fisicas}</td>
+                    <td class="px-6 py-4 text-sm text-gray-500 text-center">${m.ofertas_recibidas}</td>
+                </tr>
+            `).join('');
+        }
+        
+        // --- LÓGICA DE INFORMES Y PDF ---
+        
+        /**
+         * Función auxiliar para formatear números como separadores de miles.
+         * @param {number|string} value - El número a formatear.
+         * @returns {string} - El número formateado.
+         */
+        function formatNumber(value) {
+            // Aseguramos que sea un número y lo formateamos con separadores de miles
+            const num = Number(value);
+            if (isNaN(num)) return value;
+            return num.toLocaleString('es-ES');
+        }
+
+        /**
+         * Genera el contenido HTML del informe y lo inserta en el DOM.
+         */
+        window.renderReportContent = function(reportData) {
+            const outputContainer = document.getElementById('report-output');
+            
+            if (!reportData) {
+                outputContainer.innerHTML = '<p class="text-gray-500 italic">Filtra y genera un informe.</p>';
+                document.getElementById('download-pdf-button').classList.add('hidden');
+                document.getElementById('copy-report-button').classList.add('hidden');
+                return;
+            }
+            
+            const p = reportData.property;
+            const totals = reportData.totals;
+            const conversion = reportData.conversion;
+            const dateRange = reportData.dateRange;
+            const totalMetricsCount = reportData.totalMetricsCount;
+
+            // Generar el HTML para el informe
+            const htmlContent = `
+                <div id="pdf-content" class="p-6 sm:p-8 bg-white text-gray-800 shadow-md">
+                    <!-- HEADER -->
+                    <header class="mb-6 border-b border-gray-200 pb-4">
+                        <h1 class="text-2xl font-extrabold text-realestate-primary">INFORME DE DESEMPEÑO DE PROPIEDAD</h1>
+                        <p class="text-sm text-gray-500 mt-1">
+                            <span class="font-semibold">${p.direccion}</span> | Período: ${dateRange} (${totalMetricsCount} registros)
+                        </p>
+                        <p class="text-xs text-gray-400 mt-1">Generado: ${new Date().toLocaleDateString('es-ES', { day: '2-digit', month: 'long', year: 'numeric' })}</p>
+                    </header>
+
+                    <!-- SECCIÓN: DETALLES COMERCIALES -->
+                    <section class="mb-6">
+                        <h2 class="text-lg font-semibold text-gray-700 mb-3 border-b pb-1">1. Detalles Comerciales</h2>
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
+                            <div class="p-3 bg-gray-50 rounded-lg"><span class="font-medium">ID Interno:</span> <span class="text-realestate-primary font-mono">${p.id.substring(0, 10)}...</span></div>
+                            <div class="p-3 bg-gray-50 rounded-lg"><span class="font-medium">Tipo / Estado:</span> ${p.tipo} / ${p.estado}</div>
+                            <div class="p-3 bg-gray-50 rounded-lg"><span class="font-medium">Fecha de Publicación:</span> ${p.fecha_inicio}</div>
+                            <div class="p-3 bg-gray-50 rounded-lg col-span-1 sm:col-span-3"><span class="font-medium">Precio de Publicación:</span> <span class="text-lg font-bold text-realestate-accent">${formatNumber(p.precio_publicacion)} ${p.moneda_publicacion}</span></div>
+                        </div>
+                    </section>
+
+                    <!-- SECCIÓN: MÉTRICAS AGREGADAS -->
+                    <section class="mb-6">
+                        <h2 class="text-lg font-semibold text-gray-700 mb-3 border-b pb-1">2. Resumen de Métricas Agregadas</h2>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+                            ${[
+                                { label: 'Visualizaciones Online', value: totals.visualizaciones, color: 'text-indigo-600' },
+                                { label: 'Contactos Recibidos', value: totals.contactos, color: 'text-green-600' },
+                                { label: 'Visitas Físicas', value: totals.visitas_fisicas, color: 'text-yellow-600' },
+                                { label: 'Ofertas en Firme', value: totals.ofertas_recibidas, color: 'text-red-600' }
+                            ].map(item => `
+                                <div class="bg-gray-50 p-4 rounded-xl shadow-inner border border-gray-100">
+                                    <p class="text-3xl font-bold ${item.color}">${formatNumber(item.value)}</p>
+                                    <p class="text-sm text-gray-500 mt-1">${item.label}</p>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </section>
+
+                    <!-- SECCIÓN: TASAS DE CONVERSIÓN -->
+                    <section class="mb-6">
+                        <h2 class="text-lg font-semibold text-gray-700 mb-3 border-b pb-1">3. Tasas de Conversión</h2>
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-center">
+                            ${[
+                                { label: 'Contacto', value: conversion.conversionContactos, desc: ' vs Visualizaciones' },
+                                { label: 'Visita', value: conversion.conversionVisitas, desc: ' vs Visualizaciones' },
+                                { label: 'Oferta', value: conversion.conversionOfertas, desc: ' vs Visualizaciones' }
+                            ].map(item => `
+                                <div class="bg-realestate-secondary p-4 rounded-xl shadow-md border border-realestate-primary/20">
+                                    <p class="text-3xl font-bold text-realestate-primary">${item.value.toFixed(2)}%</p>
+                                    <p class="text-sm text-gray-600 mt-1">${item.label} ${item.desc}</p>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </section>
+
+                    <!-- SECCIÓN: ANÁLISIS CLAVE (simulando análisis de texto) -->
+                    <section>
+                        <h2 class="text-lg font-semibold text-gray-700 mb-3 border-b pb-1">4. Conclusión Clave</h2>
+                        <p class="text-sm leading-relaxed bg-blue-50 p-4 rounded-lg border-l-4 border-realestate-primary/50">
+                            La propiedad en ${p.direccion} ha demostrado un sólido interés en línea, con una tasa de conversión de Visualización a Contacto del 
+                            <strong class="text-realestate-primary">${conversion.conversionContactos.toFixed(2)}%</strong>. El enfoque ahora debe estar en aumentar la 
+                            conversión de las **${formatNumber(totals.visitas_fisicas)} visitas físicas** a ofertas firmes, 
+                            aprovechando el valor de publicación de **${formatNumber(p.precio_publicacion)} ${p.moneda_publicacion}**, que se encuentra dentro del rango estimado.
+                        </p>
+                    </section>
+                </div>
+            `;
+            
+            outputContainer.innerHTML = htmlContent;
+            
+            // Mostrar botones de acción
+            document.getElementById('download-pdf-button').classList.remove('hidden');
+            document.getElementById('copy-report-button').classList.remove('hidden');
+
+            window.showMessage('Informe renderizado. Listo para descargar.', 'success');
+        }
+
+        /**
+         * Prepara los datos del informe y llama a la generación de HTML/PDF.
+         */
+        window.generateReportAndPDF = function(shouldDownload = false) {
+            const propertyId = document.getElementById('informe_propiedad_id').value;
+            const dateFrom = document.getElementById('informe_fecha_inicio').value;
+            const dateTo = document.getElementById('informe_fecha_termino').value;
+            
+            if (!propertyId || !dateFrom || !dateTo) {
+                window.renderReportContent(null);
+                window.showMessage('Por favor, selecciona una propiedad y un rango de fechas.', 'error');
+                return;
+            }
+
+            const property = window.registeredProperties.find(p => p.id === propertyId);
+            if (!property) {
+                window.renderReportContent(null);
+                window.showMessage('Error: Propiedad no encontrada.', 'error');
+                return;
+            }
+
+            // 1. Filtrar Métricas
+            const filteredMetrics = window.allMetrics.filter(m => {
+                const measurementDate = m.fecha_medicion;
+                return m.propiedad_id === propertyId && 
+                       measurementDate >= dateFrom && 
+                       measurementDate <= dateTo;
+            });
+            
+            if (filteredMetrics.length === 0) {
+                window.renderReportContent(null);
+                document.getElementById('report-output').innerHTML = `<p class="text-gray-500 italic">No hay métricas registradas para la propiedad "${property.direccion}" en el período del ${dateFrom} al ${dateTo}.</p>`;
+                return;
+            }
+
+            // 2. Agregación de Datos
+            const totals = filteredMetrics.reduce((acc, metric) => {
+                acc.visualizaciones += metric.visualizaciones;
+                acc.contactos += metric.contactos;
+                acc.visitas_fisicas += metric.visitas_fisicas;
+                acc.ofertas_recibidas += metric.ofertas_recibidas;
+                return acc;
+            }, {
+                visualizaciones: 0,
+                contactos: 0,
+                visitas_fisicas: 0,
+                ofertas_recibidas: 0
+            });
+            
+            const totalMetricsCount = filteredMetrics.length;
+            const totalVisualizations = totals.visualizaciones;
+
+            // 3. Cálculo de Conversiones
+            const conversionContactos = totalVisualizations > 0 ? ((totals.contactos / totalVisualizations) * 100) : 0;
+            const conversionVisitas = totalVisualizations > 0 ? ((totals.visitas_fisicas / totalVisualizations) * 100) : 0;
+            const conversionOfertas = totalVisualizations > 0 ? ((totals.ofertas_recibidas / totalVisualizations) * 100) : 0;
+
+            const reportData = {
+                property: property,
+                totals: totals,
+                conversion: { conversionContactos, conversionVisitas, conversionOfertas },
+                dateRange: `Del ${dateFrom} al ${dateTo}`,
+                totalMetricsCount: totalMetricsCount
+            };
+            
+            // 4. Renderizar contenido HTML
+            window.renderReportContent(reportData);
+            
+            // 5. Descargar PDF si se solicitó
+            if (shouldDownload) {
+                downloadPDF(property.direccion, dateFrom, dateTo);
+            }
+        }
+        
+        /**
+         * Inicia la descarga del informe como PDF.
+         */
+        function downloadPDF(direccion, dateFrom, dateTo) {
+            const element = document.getElementById('pdf-content');
+
+            // Opciones de configuración para html2pdf.
+            const options = {
+                margin:       [10, 10, 10, 10], // top, left, bottom, right
+                filename:     `Informe_${direccion.replace(/[^a-zA-Z0-9]/g, '_')}_${dateFrom}_a_${dateTo}.pdf`,
+                image:        { type: 'jpeg', quality: 0.98 },
+                html2canvas:  { scale: 2, logging: false, dpi: 192, letterRendering: true, useCORS: true },
+                jsPDF:        { unit: 'mm', format: 'a4', orientation: 'portrait' }
+            };
+
+            // Aseguramos que el contenido esté visible antes de la descarga
+            element.classList.remove('hidden');
+            
+            html2pdf().from(element).set(options).outputPdf('datauristring').then((pdf) => {
+                 // Puedes usar .save() o, para manejo más complejo, .outputPdf().then(pdf => ...)
+                 html2pdf().from(element).set(options).save();
+                 window.showMessage('PDF generado y descargado exitosamente.', 'success');
+            }).catch(error => {
+                console.error("Error al generar el PDF:", error);
+                window.showMessage('Error al generar el PDF. Revisa la consola.', 'error');
+            });
+        }
+        
+        /**
+         * Copia el contenido del informe (solo el texto visible) al portapapeles.
+         */
+        window.copyReportToClipboard = function() {
+            // Extraer el texto del contenedor PDF (solo el contenido principal)
+            const pdfContentElement = document.getElementById('pdf-content');
+            if (!pdfContentElement) {
+                window.showMessage('No hay informe generado para copiar.', 'error');
+                return;
+            }
+
+            // Simplificamos la extracción de texto para el portapapeles
+            const reportContent = pdfContentElement.innerText || pdfContentElement.textContent;
+            
+            // Usar execCommand ya que navigator.clipboard.writeText puede fallar en iframes
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = reportContent.trim();
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            
+            try {
+                const successful = document.execCommand('copy');
+                if (successful) {
+                    window.showMessage('Contenido del informe copiado al portapapeles.', 'success');
+                } else {
+                    window.showMessage('Error al intentar copiar el informe.', 'error');
+                }
+            } catch (err) {
+                console.error('Error al copiar: ', err);
+                window.showMessage('Error al intentar copiar el informe.', 'error');
+            }
+            
+            document.body.removeChild(tempTextArea);
+        }
+
+        // --- Inicialización y Manejadores de Eventos del Módulo ---
+        window.addEventListener('load', function() {
+            initFirebase();
+
+            // 1. Manejador para el formulario de Registro de Propiedades
+            const propForm = document.getElementById('property-registration-form');
+            if (propForm) {
+                propForm.addEventListener('submit', async function(e) {
+                    e.preventDefault();
+                    
+                    const formData = new FormData(propForm);
+                    const data = {};
+                    formData.forEach((value, key) => {
+                        data[key] = value;
+                    });
+
+                    const saved = await saveProperty(data);
+                    if (saved) {
+                        propForm.reset(); 
+                    }
+                });
+            }
+
+            // 2. Manejador para el formulario de Registro de Métricas
+            const metricForm = document.getElementById('metric-registration-form');
+            if (metricForm) {
+                metricForm.addEventListener('submit', async function(e) {
+                    e.preventDefault();
+                    
+                    const formData = new FormData(metricForm);
+                    const data = {};
+                    formData.forEach((value, key) => {
+                        data[key] = value;
+                    });
+                    
+                    const saved = await saveMetric(data);
+                    if (saved) {
+                        // Resetear solo los campos numéricos y la fecha, manteniendo la selección de propiedad
+                        metricForm.elements['fecha_medicion'].value = '';
+                        metricForm.elements['visualizaciones'].value = '';
+                        metricForm.elements['contactos'].value = '';
+                        metricForm.elements['visitas_fisicas'].value = '';
+                        metricForm.elements['ofertas_recibidas'].value = '';
+                    }
+                });
+            }
+            
+            // 3. Manejador para la aplicación de filtros de visualización
+            const filterButton = document.getElementById('apply-filters-button');
+            if (filterButton) {
+                filterButton.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    window.filterAndRenderCharts();
+                });
+            }
+            
+            // 4. Manejador para la generación de informes (solo renderizado de HTML)
+            const reportButton = document.getElementById('generate-report-button');
+            if (reportButton) {
+                reportButton.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    window.generateReportAndPDF(false); // Solo renderiza, no descarga
+                });
+            }
+            
+            // 5. Manejador para la descarga del PDF
+            const downloadButton = document.getElementById('download-pdf-button');
+            if (downloadButton) {
+                downloadButton.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    // Llama a generar el informe y luego descarga el PDF
+                    window.generateReportAndPDF(true); 
+                });
+            }
+            
+            // 6. Manejador para copiar el informe
+            const copyButton = document.getElementById('copy-report-button');
+            if (copyButton) {
+                copyButton.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    window.copyReportToClipboard();
+                });
+            }
+        });
+    </script>
+</head>
+<body class="flex flex-col lg:flex-row min-h-screen font-sans bg-gray-50">
+
+    
+<div id="message-container" class="hidden fixed top-0 left-1/2 transform -translate-x-1/2 mt-4 p-4 rounded-lg shadow-xl z-50 transition-opacity duration-300"></div>
+
+    
+<nav id="sidebar" class="bg-white shadow-lg p-4 lg:w-64 w-full flex lg:flex-col justify-around lg:justify-start lg:min-h-screen border-b lg:border-r border-gray-200">
+        
+        <!-- Logo de Vivabien Propiedades -->
+        <div class="mb-6 flex justify-center lg:block">
+            <div class="h-16 lg:h-24 w-full flex items-center justify-center text-xl font-bold text-realestate-primary border-b border-gray-200">
+                VIVABIEN
+            </div>
+        </div>
+
+        
+        <button onclick="showSection('registro-propiedades')" data-target="registro-propiedades"
+            class="flex items-center p-3 rounded-lg font-normal transition duration-150 ease-in-out hover:bg-gray-100 lg:w-full lg:mb-2 text-sm lg:text-base">
+            <i data-lucide="home" class="w-5 h-5 mr-2"></i> Registro Propiedades
+        </button>
+
+        <button onclick="showSection('registro-metricas')" data-target="registro-metricas"
+            class="flex items-center p-3 rounded-lg font-normal transition duration-150 ease-in-out hover:bg-gray-100 lg:w-full lg:mb-2 text-sm lg:text-base">
+            <i data-lucide="plus-circle" class="w-5 h-5 mr-2"></i> Registro de Métricas
+        </button>
+
+        <button onclick="showSection('visualizacion-datos')" data-target="visualizacion-datos"
+            class="flex items-center p-3 rounded-lg font-normal transition duration-150 ease-in-out hover:bg-gray-100 lg:w-full lg:mb-2 text-sm lg:text-base">
+            <i data-lucide="bar-chart-3" class="w-5 h-5 mr-2"></i> Visualización
+        </button>
+
+        <button onclick="showSection('informes')" data-target="informes"
+            class="flex items-center p-3 rounded-lg font-normal transition duration-150 ease-in-out hover:bg-gray-100 lg:w-full lg:mb-2 text-sm lg:text-base bg-realestate-secondary text-realestate-primary">
+            <i data-lucide="file-text" class="w-5 h-5 mr-2"></i> Informes
+        </button>
+    </nav>
+
+    
+<main class="flex-1 p-4 sm:p-8 overflow-y-auto">
+
+        
+<h1 class="text-3xl sm:text-4xl font-bold mb-8 text-realestate-primary">
+            Gestor de Métrica de Vivabien Propiedades
+        </h1>
+        
+        <!-- NOTIFICACIÓN DE ID DE USUARIO -->
+        <div class="p-3 mb-6 bg-gray-200 rounded-lg text-sm text-gray-700 shadow-inner">
+            <p>ID de Usuario (para Firestore): <span id="current-user-id" class="font-mono font-semibold text-realestate-primary">Cargando...</span></p>
+        </div>
+
+        
+<section id="registro-propiedades" class="p-6 bg-white rounded-xl shadow-lg mb-8 hidden">
+            
+<h2 class="text-2xl font-medium mb-6 pb-2 border-b text-realestate-primary">1. Registro de Propiedades</h2>
+            
+            <form id="property-registration-form">
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-6">
+                    
+                    <!-- Dirección y Comuna -->
+                    <div>
+                        <label for="direccion" class="block text-sm font-normal text-gray-700">Dirección y Comuna</label>
+                        <input type="text" id="direccion" name="direccion" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    
+                    <!-- Tipo -->
+                    <div>
+                        <label for="tipo" class="block text-sm font-normal text-gray-700">Tipo</label>
+                        <select id="tipo" name="tipo" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                            <option>Casa</option>
+                            <option>Departamento</option>
+                            <option>Oficina</option>
+                            <option>Sitio</option>
+                            <option>Terreno</option>
+                            <option>Local Comercial</option>
+                        </select>
+                    </div>
+
+                    <!-- Fecha de Inicio (ID y NAME actualizados) -->
+                    <div>
+                        <label for="fecha_inicio" class="block text-sm font-normal text-gray-700">Fecha de Inicio</label>
+                        <input type="date" id="fecha_inicio" name="fecha_inicio" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+
+                    <!-- Precio de Publicación y Moneda -->
+                    <div>
+                        <label for="precio_publicacion" class="block text-sm font-normal text-gray-700">Precio de Publicación</label>
+                        <div class="mt-1 flex rounded-lg shadow-sm">
+                            <select id="moneda_publicacion" name="moneda_publicacion" required class="block rounded-l-lg border-gray-300 focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                                <option>UF</option>
+                                <option>CLP</option>
+                            </select>
+                            <input type="number" id="precio_publicacion" name="precio_publicacion" required class="flex-1 block w-full rounded-r-lg border-gray-300 focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border-l-0">
+                        </div>
+                    </div>
+                    
+                    <!-- Rango Comercial Estimado -->
+                    <div class="md:col-span-2">
+                        <label class="block text-sm font-normal text-gray-700 mb-1">Rango Comercial Estimado (Min/Max)</label>
+                        <div class="grid grid-cols-2 gap-4">
+                            <!-- Precio Mínimo -->
+                            <div class="flex rounded-lg shadow-sm">
+                                <select id="moneda_min" name="moneda_min" required class="block rounded-l-lg border-gray-300 focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                                    <option>UF</option>
+                                    <option>CLP</option>
+                                </select>
+                                <input type="number" id="precio_min" name="precio_min" placeholder="Mínimo" required class="flex-1 block w-full rounded-r-lg border-gray-300 focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border-l-0">
+                            </div>
+                            <!-- Precio Máximo -->
+                            <div class="flex rounded-lg shadow-sm">
+                                <select id="moneda_max" name="moneda_max" required class="block rounded-l-lg border-gray-300 focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                                    <option>UF</option>
+                                    <option>CLP</option>
+                                </select>
+                                <input type="number" id="precio_max" name="precio_max" placeholder="Máximo" required class="flex-1 block w-full rounded-r-lg border-gray-300 focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border-l-0">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Estado -->
+                    <div>
+                        <label for="estado" class="block text-sm font-normal text-gray-700">Estado</label>
+                        <select id="estado" name="estado" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                            <option>Activa</option>
+                            <option>Pausada</option>
+                        </select>
+                    </div>
+
+                </div>
+                
+                
+<button type="submit"
+                    class="w-full sm:w-auto px-6 py-2 border border-transparent rounded-lg shadow-md text-sm font-normal text-white 
+                           bg-realestate-primary hover:bg-realestate-primary/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-realestate-primary transition duration-150 ease-in-out">
+                    Guardar Propiedad
+                </button>
+            </form>
+
+            
+<div class="mt-10 pt-6 border-t border-gray-200">
+                <h3 class="text-xl font-medium mb-4 text-realestate-primary">Historial de Propiedades Registradas</h3>
+
+                <div class="overflow-x-auto shadow rounded-lg">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID (8 digitos)</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Dirección</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tipo</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Fecha Inicio</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Precio Pub.</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Estado</th>
+                            </tr>
+                        </thead>
+                        <tbody id="properties-history-body" class="bg-white divide-y divide-gray-200">
+                            <tr><td colspan="6" class="p-4 text-center text-gray-500">Cargando propiedades...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        
+<section id="registro-metricas" class="p-6 bg-white rounded-xl shadow-lg mb-8 hidden">
+            
+<h2 class="text-2xl font-medium mb-6 pb-2 border-b text-realestate-primary">2. Registro de Métricas por Fecha</h2>
+            <p class="mb-4 text-sm text-gray-600">Selecciona la propiedad a la que se vincularán las siguientes métricas de desempeño.</p>
+            
+            <form id="metric-registration-form">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+                    <!-- Selector de Propiedad -->
+                    <div>
+                        <label for="propiedad_id" class="block text-sm font-normal text-gray-700">Propiedad</label>
+                        <select id="propiedad_id" name="propiedad_id" required 
+                                class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                            <option value="" disabled selected>Cargando propiedades...</option>
+                            <!-- Opciones cargadas por JavaScript -->
+                        </select>
+                    </div>
+
+                    <div>
+                        <label for="fecha_medicion" class="block text-sm font-normal text-gray-700">Fecha de Medición</label>
+                        <input type="date" id="fecha_medicion" name="fecha_medicion" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    <div>
+                        <label for="visualizaciones" class="block text-sm font-normal text-gray-700">Visualizaciones</label>
+                        <input type="number" id="visualizaciones" name="visualizaciones" min="0" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    <div>
+                        <label for="contactos" class="block text-sm font-normal text-gray-700">Contactos Recibidos</label>
+                        <input type="number" id="contactos" name="contactos" min="0" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    <div>
+                        <label for="visitas_fisicas" class="block text-sm font-normal text-gray-700">Visitas Físicas</label>
+                        <input type="number" id="visitas_fisicas" name="visitas_fisicas" min="0" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    <div>
+                        <label for="ofertas_recibidas" class="block text-sm font-normal text-gray-700">Ofertas Recibidas</label>
+                        <input type="number" id="ofertas_recibidas" name="ofertas_recibidas" min="0" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                </div>
+
+                
+<button type="submit"
+                    class="w-full sm:w-auto px-6 py-2 border border-transparent rounded-lg shadow-md text-sm font-normal text-white 
+                           bg-realestate-primary hover:bg-realestate-primary/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-realestate-primary transition duration-150 ease-in-out">
+                    Registrar Métrica
+                </button>
+            </form>
+            
+            <!-- HISTORIAL DE MÉTRICAS -->
+            <div class="mt-10 pt-6 border-t border-gray-200">
+                <h3 class="text-xl font-medium mb-4 text-realestate-primary">Historial Completo de Métricas (Todas las Propiedades)</h3>
+
+                <div class="overflow-x-auto shadow rounded-lg">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Fecha Medición</th>
+                                <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID Propiedad</th>
+                                <th scope="col" class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Visualizaciones</th>
+                                <th scope="col" class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Contactos</th>
+                                <th scope="col" class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Visitas Físicas</th>
+                                <th scope="col" class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Ofertas</th>
+                            </tr>
+                        </thead>
+                        <tbody id="metrics-history-body" class="bg-white divide-y divide-gray-200">
+                            <tr><td colspan="6" class="p-4 text-center text-gray-500">Cargando métricas...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        
+<section id="visualizacion-datos" class="p-6 bg-white rounded-xl shadow-lg mb-8 hidden">
+            
+<h2 class="text-2xl font-medium mb-6 pb-2 border-b text-realestate-primary">3. Visualización y Filtros Inteligentes</h2>
+
+            <form id="visualization-filters-form">
+                <div class="mb-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <!-- Filtro por Propiedad -->
+                    <div>
+                        <label for="visualizacion_propiedad_id" class="block text-sm font-normal text-gray-700">Propiedad</label>
+                        <select id="visualizacion_propiedad_id" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                            <option value="" disabled selected>Selecciona una propiedad</option>
+                            <!-- Opciones cargadas por JavaScript -->
+                        </select>
+                    </div>
+
+                    <!-- Filtro Fecha Desde -->
+                    <div>
+                        <label for="fecha_filtro_inicio" class="block text-sm font-normal text-gray-700">Fecha Desde</label>
+                        <input type="date" id="fecha_filtro_inicio" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    
+                    <!-- Filtro Fecha Hasta -->
+                    <div>
+                        <label for="fecha_filtro_termino" class="block text-sm font-normal text-gray-700">Fecha Hasta</label>
+                        <input type="date" id="fecha_filtro_termino" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    
+                    <!-- Botón de Filtrado -->
+                    <div class="flex items-end pt-2 sm:pt-0">
+                        <button type="button" id="apply-filters-button"
+                            class="w-full px-6 py-2 border border-transparent rounded-lg shadow-md text-sm font-normal text-white 
+                                   bg-realestate-primary hover:bg-realestate-primary/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-realestate-primary transition duration-150 ease-in-out">
+                            <i data-lucide="search" class="w-4 h-4 mr-1 inline-block"></i>
+                            Aplicar Filtros
+                        </button>
+                    </div>
+                </div>
+            </form>
+
+            
+            <div class="mt-8">
+                <h3 class="text-xl font-medium mb-4 text-realestate-primary">Gráfico de Evolución de Métricas</h3>
+                <div class="relative bg-white p-4 rounded-xl shadow-lg border border-gray-200" style="height: 500px;">
+                    <!-- Contenedor del Gráfico -->
+                    <canvas id="metricsChart"></canvas>
+                    <!-- Mensaje de Carga/Sin Datos -->
+                    <div id="chart-message" class="absolute inset-0 flex flex-col items-center justify-center bg-gray-50/70 p-4 rounded-xl hidden">
+                        <i data-lucide="bar-chart-3" class="w-12 h-12 text-gray-400 mb-2"></i>
+                        <p class="text-lg font-semibold text-gray-500">Selecciona una propiedad y registra métricas para ver la evolución.</p>
+                        <p class="text-sm text-gray-400 mt-1">El gráfico se actualizará automáticamente con nuevos datos.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        
+<section id="informes" class="p-6 bg-white rounded-xl shadow-lg mb-8">
+            
+<h2 class="text-2xl font-medium mb-6 pb-2 border-b text-realestate-primary">4. Generación de Informes de Desempeño</h2>
+            
+            <form id="report-generation-form">
+                <p class="text-gray-700 mb-4 text-sm">Selecciona la propiedad y el rango de fechas para generar el informe de resumen.</p>
+                <div class="mb-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
+                    <!-- Filtro por Propiedad -->
+                    <div>
+                        <label for="informe_propiedad_id" class="block text-sm font-normal text-gray-700">Propiedad</label>
+                        <select id="informe_propiedad_id" required 
+                                class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border bg-white">
+                            <option value="" disabled selected>Selecciona una propiedad</option>
+                            <!-- Opciones cargadas por JavaScript -->
+                        </select>
+                    </div>
+                    
+                    <!-- Filtro Fecha Desde -->
+                    <div>
+                        <label for="informe_fecha_inicio" class="block text-sm font-normal text-gray-700">Período Desde</label>
+                        <input type="date" id="informe_fecha_inicio" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    
+                    <!-- Filtro Fecha Hasta -->
+                    <div>
+                        <label for="informe_fecha_termino" class="block text-sm font-normal text-gray-700">Período Hasta</label>
+                        <input type="date" id="informe_fecha_termino" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-realestate-primary focus:ring focus:ring-realestate-primary focus:ring-opacity-50 p-2 border">
+                    </div>
+                    
+                    <!-- Botón de Generación -->
+                    <div class="flex items-end pt-2 sm:pt-0">
+                        <button type="button" id="generate-report-button"
+                            class="w-full px-6 py-2 border border-transparent rounded-lg shadow-md text-sm font-normal text-white 
+                                   bg-realestate-primary hover:bg-realestate-primary/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-realestate-primary transition duration-150 ease-in-out">
+                            <i data-lucide="file-text" class="w-4 h-4 mr-1 inline-block"></i>
+                            Generar Informe
+                        </button>
+                    </div>
+                </div>
+            </form>
+            
+            <!-- Contenedor del Reporte Generado -->
+            <div class="mt-8 pt-6 border-t border-gray-200">
+                <h3 class="text-xl font-medium mb-4 text-realestate-primary">Vista Previa del Informe</h3>
+                
+                <div id="report-output-container" class="relative bg-gray-100 p-2 rounded-xl shadow-inner">
+                    <!-- Botones de Acción (Visibles solo si hay informe generado) -->
+                    <div class="flex justify-end space-x-2 mb-4">
+                        <button type="button" id="copy-report-button"
+                            class="hidden p-2 bg-gray-300 text-gray-800 rounded-lg shadow-md hover:bg-gray-400 transition duration-150 ease-in-out text-sm"
+                            title="Copiar texto del informe">
+                            <i data-lucide="clipboard-copy" class="w-4 h-4 inline-block mr-1"></i>
+                            Copiar Texto
+                        </button>
+                        <button type="button" id="download-pdf-button"
+                            class="hidden px-4 py-2 bg-realestate-accent text-white rounded-lg shadow-md hover:bg-realestate-accent/80 transition duration-150 ease-in-out text-sm font-medium"
+                            title="Descargar como PDF">
+                            <i data-lucide="download" class="w-4 h-4 inline-block mr-1"></i>
+                            Descargar PDF
+                        </button>
+                    </div>
+                    
+                    <!-- Área de Visualización del Informe (el contenido que se convertirá a PDF) -->
+                    <div id="report-output" class="bg-white rounded-xl shadow-lg border border-gray-200">
+                        <p class="p-6 text-gray-500 italic">Filtra y genera un informe.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+</body>
+</html>
